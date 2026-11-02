@@ -1,0 +1,23 @@
+[
+  {
+    "id": 123456,
+    "name": "iPhone 15 128GB",
+    "url_key": "iphone-15-128gb",
+    "price": 16990000,
+    "description": "Apple iPhone 15 với màn hình Super Retina XDR.",
+    "images_url": [
+      "https://example.com/iphone-front.jpg",
+      "https://example.com/iphone-back.jpg"
+    ]
+  },
+  {
+    "id": 789012,
+    "name": "Samsung Galaxy S24",
+    "url_key": "samsung-galaxy-s24",
+    "price": 18990000,
+    "description": "Samsung Galaxy S24 với màn hình Dynamic AMOLED.",
+    "images_url": [
+      "https://example.com/samsung.jpg"
+    ]
+  }
+]
