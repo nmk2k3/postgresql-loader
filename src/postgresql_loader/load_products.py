@@ -79,11 +79,31 @@ def main() -> int:
         for path in files:
             count = load_products(path)
             print(f"Loaded {count} products from {path}.")
-    except (OSError, TypeError, ValueError, psycopg.Error) as error:
-        print(f"Failed to load products from {path}: {error}", file=sys.stderr)
-        return 1
+    except FileNotFoundError as error:
+        message = f"File not found: {error.filename or path}"
+    except PermissionError as error:
+        message = f"Permission denied reading: {error.filename or path}"
+    except json.JSONDecodeError as error:
+        message = (
+            f"Invalid JSON at line {error.lineno}, column {error.colno}: {error.msg}"
+        )
+    except UnicodeError as error:
+        message = f"Unable to decode file as UTF-8: {error}"
+    except OSError as error:
+        message = f"Unable to read input or SQL file: {error}"
+    except psycopg.OperationalError as error:
+        message = f"PostgreSQL connection or operation failed: {error}"
+    except psycopg.IntegrityError as error:
+        message = f"Product data violates a database constraint: {error}"
+    except psycopg.Error as error:
+        message = f"Database error: {error}"
+    except (TypeError, ValueError) as error:
+        message = str(error)
+    else:
+        return 0
 
-    return 0
+    print(f"Failed to load products from {path}: {message}", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

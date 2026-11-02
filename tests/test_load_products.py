@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 import psycopg
 
+from postgresql_loader import create_tables, database
 from postgresql_loader import load_products as loader
 
 
@@ -105,7 +107,10 @@ class LoadProductsTests(unittest.TestCase):
     def test_cli_reports_invalid_product_type(self):
         self.write_json([1])
         output = io.StringIO()
-        with patch("sys.argv", ["load_products", str(self.path)]), redirect_stderr(output):
+        with (
+            patch("sys.argv", ["load_products", str(self.path)]),
+            redirect_stderr(output),
+        ):
             self.assertEqual(loader.main(), 1)
         self.assertIn("Product 1 must be a JSON object", output.getvalue())
         self.connect.assert_not_called()
@@ -161,7 +166,72 @@ class LoadProductsTests(unittest.TestCase):
         ):
             self.assertEqual(loader.main(), 1)
         self.assertIn("Failed to load products", output.getvalue())
+        self.assertIn("File not found", output.getvalue())
         self.connect.assert_not_called()
+
+    def test_cli_reports_read_errors(self):
+        for error, message in (
+            (PermissionError("access denied"), "Permission denied reading"),
+            (OSError("read failed"), "Unable to read input or SQL file"),
+            (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte"), "UTF-8"),
+        ):
+            with self.subTest(error=error):
+                output = io.StringIO()
+                with (
+                    patch("sys.argv", ["load_products", str(self.path)]),
+                    patch.object(Path, "read_text", side_effect=error),
+                    redirect_stderr(output),
+                ):
+                    self.assertEqual(loader.main(), 1)
+                self.assertIn(message, output.getvalue())
+                self.assertIn(str(self.path), output.getvalue())
+        self.connect.assert_not_called()
+
+    def test_cli_reports_json_location(self):
+        self.path.write_text("[\n  {invalid}\n]", encoding="utf-8")
+        output = io.StringIO()
+        with (
+            patch("sys.argv", ["load_products", str(self.path)]),
+            redirect_stderr(output),
+        ):
+            self.assertEqual(loader.main(), 1)
+        self.assertIn("Invalid JSON at line 2, column 4", output.getvalue())
+        self.connect.assert_not_called()
+
+    def test_cli_reports_connection_error(self):
+        self.write_json([self.product])
+        self.connect.side_effect = psycopg.OperationalError("connection refused")
+        output = io.StringIO()
+        with (
+            patch("sys.argv", ["load_products", str(self.path)]),
+            redirect_stderr(output),
+        ):
+            self.assertEqual(loader.main(), 1)
+        self.assertIn("PostgreSQL connection or operation failed", output.getvalue())
+        self.assertIn("connection refused", output.getvalue())
+
+    def test_cli_reports_database_errors_and_preserves_rollback(self):
+        self.write_json([self.product])
+        for error, message in (
+            (psycopg.errors.CheckViolation("invalid price"), "database constraint"),
+            (
+                psycopg.OperationalError("connection lost"),
+                "connection or operation failed",
+            ),
+            (psycopg.ProgrammingError("bad SQL"), "Database error"),
+        ):
+            with self.subTest(error=error):
+                self.cursor.executemany.side_effect = error
+                output = io.StringIO()
+                with (
+                    patch("sys.argv", ["load_products", str(self.path)]),
+                    redirect_stderr(output),
+                ):
+                    self.assertEqual(loader.main(), 1)
+                self.assertIn(message, output.getvalue())
+                self.assertIs(
+                    self.connect.return_value.__exit__.call_args.args[1], error
+                )
 
     def test_directory_loads_matching_files_in_order_with_separate_transactions(self):
         directory = self.path.parent
@@ -249,6 +319,122 @@ class LoadProductsTests(unittest.TestCase):
         self.assertIs(exits[1].args[1], error)
         self.assertIn("products_002.json", errors.getvalue())
         self.assertNotIn("products_003.json", output.getvalue())
+
+
+class CreateTablesTests(unittest.TestCase):
+    def test_sql_read_errors_skip_database(self):
+        for error, message in (
+            (FileNotFoundError(), "SQL file not found"),
+            (PermissionError(), "Permission denied reading SQL file"),
+            (OSError("read failed"), "Unable to read SQL file"),
+            (
+                UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte"),
+                "Unable to read SQL file",
+            ),
+        ):
+            with self.subTest(error=error):
+                output = io.StringIO()
+                with (
+                    patch.object(Path, "read_text", side_effect=error),
+                    patch.object(create_tables, "get_connection") as connect,
+                    redirect_stderr(output),
+                ):
+                    self.assertEqual(create_tables.main(), 1)
+                self.assertIn(message, output.getvalue())
+                self.assertIn("products.sql", output.getvalue())
+                connect.assert_not_called()
+
+    def test_connection_and_configuration_errors(self):
+        for error, message in (
+            (
+                psycopg.OperationalError("connection refused"),
+                "connection or operation failed",
+            ),
+            (ValueError("missing password"), "database configuration"),
+            (OSError("cannot read .env"), "database configuration"),
+        ):
+            with self.subTest(error=error):
+                output = io.StringIO()
+                with (
+                    patch.object(create_tables, "get_connection", side_effect=error),
+                    redirect_stderr(output),
+                ):
+                    self.assertEqual(create_tables.main(), 1)
+                self.assertIn(message, output.getvalue())
+
+    def test_sql_error_reaches_transaction_context(self):
+        error = psycopg.ProgrammingError("bad SQL")
+        output = io.StringIO()
+        with (
+            patch.object(create_tables, "get_connection") as connect,
+            redirect_stderr(output),
+        ):
+            connect.return_value.__enter__.return_value.execute.side_effect = error
+            self.assertEqual(create_tables.main(), 1)
+        self.assertIn("Failed to execute SQL", output.getvalue())
+        self.assertIs(connect.return_value.__exit__.call_args.args[1], error)
+
+    def test_success_commits_transaction(self):
+        with (
+            patch.object(create_tables, "get_connection") as connect,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(create_tables.main(), 0)
+        connect.return_value.__exit__.assert_called_once_with(None, None, None)
+
+
+class DatabaseTests(unittest.TestCase):
+    def setUp(self):
+        for patcher in (
+            patch.dict(os.environ, {"POSTGRES_PASSWORD": "test-password"}, clear=True),
+            patch.object(database, "load_dotenv"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_missing_password_skips_connection(self):
+        del os.environ["POSTGRES_PASSWORD"]
+        with (
+            patch.object(database.psycopg, "connect") as connect,
+            self.assertRaisesRegex(ValueError, "Set POSTGRES_PASSWORD"),
+        ):
+            database.get_connection()
+        connect.assert_not_called()
+
+    def test_invalid_port_skips_connection(self):
+        for setting in ("DB_PORT", "POSTGRES_PORT"):
+            for port in ("", "invalid", "0", "65536"):
+                with self.subTest(setting=setting, port=port):
+                    with (
+                        patch.dict(os.environ, {setting: port}),
+                        patch.object(database.psycopg, "connect") as connect,
+                        self.assertRaisesRegex(ValueError, "integer from 1 to 65535"),
+                    ):
+                        database.get_connection()
+                    connect.assert_not_called()
+
+    def test_connection_failure_propagates_to_cli(self):
+        error = psycopg.OperationalError("connection refused")
+        with (
+            patch.object(database.psycopg, "connect", side_effect=error),
+            self.assertRaises(psycopg.OperationalError) as caught,
+        ):
+            database.get_connection()
+        self.assertIs(caught.exception, error)
+
+    def test_port_defaults_and_overrides(self):
+        for settings, expected_port in (
+            ({}, 5432),
+            ({"POSTGRES_PORT": "5433"}, 5433),
+            ({"POSTGRES_PORT": "5433", "DB_PORT": "5434"}, 5434),
+        ):
+            with self.subTest(settings=settings):
+                with (
+                    patch.dict(os.environ, settings),
+                    patch.object(database.psycopg, "connect") as connect,
+                ):
+                    self.assertIs(database.get_connection(), connect.return_value)
+                self.assertEqual(connect.call_args.kwargs["port"], expected_port)
 
 
 if __name__ == "__main__":
